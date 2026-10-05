@@ -68,6 +68,10 @@ def _reset_if_new_day():
 # Anti-spam par utilisateur
 _user_locks: dict[int, float] = {}
 
+# Activations en cours (pour le bouton Annuler)
+# act_id → asyncio.Event (set = annulé)
+_cancel_events: dict[str, asyncio.Event] = {}
+
 # ──────────────────────────────────────────────────────────────
 # BOT DISCORD
 # ──────────────────────────────────────────────────────────────
@@ -102,17 +106,13 @@ async def hero_buy_number() -> tuple[str, str, str] | str:
         "country": HERO_COUNTRY,
         "maxPrice": MAX_PRICE,
     })
-    # Réponse attendue : ACCESS_NUMBER:id:phone:cost  (ou variante getNumberV2)
-    # getNumberV2 peut renvoyer du JSON ou le format classique
     if "ACCESS_NUMBER" in text:
         parts = text.split(":")
-        # ACCESS_NUMBER:activationId:phoneNumber
         if len(parts) >= 3:
             act_id = parts[1]
             phone = parts[2]
             cost = parts[3] if len(parts) >= 4 else "?"
             return act_id, phone, cost
-    # Peut-être format JSON de getNumberV2
     if "{" in text:
         import json
         try:
@@ -124,11 +124,10 @@ async def hero_buy_number() -> tuple[str, str, str] | str:
                 return act_id, phone, cost
         except json.JSONDecodeError:
             pass
-    return text  # message d'erreur brut
+    return text
 
 
 async def hero_arm(act_id: str) -> str:
-    """Arme l'activation (setStatus=1). Obligatoire pour recevoir le SMS."""
     return await hero_call({"action": "setStatus", "id": act_id, "status": "1"})
 
 
@@ -166,6 +165,68 @@ async def log_to_channel(msg: str):
             await ch.send(msg[:2000])
     except Exception as e:
         log.error("log_to_channel: %s", e)
+
+
+# ──────────────────────────────────────────────────────────────
+# VUE AVEC BOUTONS COPIER + ANNULER (apparaît après achat)
+# ──────────────────────────────────────────────────────────────
+class NumberActionsView(discord.ui.View):
+    """Boutons Copier et Annuler affichés après l'achat du numéro."""
+
+    def __init__(self, phone_display: str, act_id: str):
+        super().__init__(timeout=200)
+        self.phone_display = phone_display
+        self.act_id = act_id
+
+    @discord.ui.button(label="📋  Copier le numéro", style=discord.ButtonStyle.grey)
+    async def copy_number(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Envoie le numéro brut sans embed, facile à copier
+        await interaction.response.send_message(
+            f"`{self.phone_display}`",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="❌  Annuler le numéro", style=discord.ButtonStyle.red)
+    async def cancel_number(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+
+        # Signaler au polling d'arrêter
+        event = _cancel_events.get(self.act_id)
+        if event:
+            event.set()
+
+        # Tenter l'annulation chez HeroSMS
+        cancel_resp = await hero_cancel(self.act_id)
+
+        if "EARLY_CANCEL_DENIED" in cancel_resp:
+            await interaction.followup.send(
+                "⏳ HeroSMS refuse d'annuler pour l'instant (trop tôt). "
+                "Le numéro sera remboursé automatiquement dans 20 min s'il ne reçoit pas de code.",
+                ephemeral=True,
+            )
+        elif "ACCESS_CANCEL" in cancel_resp or "CANCEL" in cancel_resp.upper():
+            await interaction.followup.send(
+                "✅ Numéro annulé. Tu peux en reprendre un autre.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                f"⚠️ Réponse HeroSMS : `{cancel_resp}`",
+                ephemeral=True,
+            )
+
+        # Désactiver les boutons
+        for child in self.children:
+            child.disabled = True
+        try:
+            await interaction.edit_original_response(view=self)
+        except Exception:
+            pass
+
+        await log_to_channel(
+            f"❌ {interaction.user.display_name} — Annulation manuelle Twitter #{self.act_id} — {cancel_resp}"
+        )
+
 
 # ──────────────────────────────────────────────────────────────
 # VUE PERSISTANTE — BOUTON « PRENDRE UN NUMÉRO »
@@ -250,7 +311,11 @@ class TwitterPanel(discord.ui.View):
         if "ACCESS_READY" not in arm_resp and "READY" not in arm_resp.upper():
             log.warning("Armement inattendu: %s (act=%s)", arm_resp, act_id)
 
-        # ── Afficher le numéro ──
+        # ── Préparer l'event d'annulation ──
+        cancel_event = asyncio.Event()
+        _cancel_events[act_id] = cancel_event
+
+        # ── Afficher le numéro avec boutons Copier + Annuler ──
         phone_display = phone if phone.startswith("+") else f"+{phone}"
         embed_num = discord.Embed(
             title="📱  TWITTER / X",
@@ -258,7 +323,9 @@ class TwitterPanel(discord.ui.View):
             color=0x1DA1F2,
         )
         embed_num.set_footer(text=f"Activation #{act_id} • Coût ${cost}")
-        await interaction.followup.send(embed=embed_num, ephemeral=True)
+
+        actions_view = NumberActionsView(phone_display, act_id)
+        await interaction.followup.send(embed=embed_num, view=actions_view, ephemeral=True)
 
         # ── DM avec le numéro ──
         try:
@@ -278,6 +345,11 @@ class TwitterPanel(discord.ui.View):
         code = None
         start = asyncio.get_event_loop().time()
         while asyncio.get_event_loop().time() - start < POLL_TIMEOUT:
+            # Vérifier si le VA a cliqué Annuler
+            if cancel_event.is_set():
+                log.info("Annulation manuelle par le VA (act=%s)", act_id)
+                break
+
             await asyncio.sleep(5)
             status = await hero_get_status(act_id)
             if status.startswith("STATUS_OK"):
@@ -286,9 +358,11 @@ class TwitterPanel(discord.ui.View):
             if "STATUS_CANCEL" in status:
                 break
 
+        # Nettoyer l'event
+        _cancel_events.pop(act_id, None)
+
         # ── Résultat ──
         if code:
-            # Marquer comme terminé
             await hero_complete(act_id)
             daily_success[uid] += 1
 
@@ -317,21 +391,21 @@ class TwitterPanel(discord.ui.View):
                 f"✅ {user.display_name} — Twitter #{act_id} — "
                 f"{phone_display} — Code `{code}`"
             )
-        else:
-            # Tenter d'annuler (peut échouer si EARLY_CANCEL_DENIED)
+
+        elif not cancel_event.is_set():
+            # Timeout — pas de code et pas d'annulation manuelle
             cancel_resp = await hero_cancel(act_id)
-            cancelled = "ACCESS_CANCEL" in cancel_resp or "CANCEL" in cancel_resp.upper()
             cancel_note = ""
             if "EARLY_CANCEL_DENIED" in cancel_resp:
-                cancel_note = "\n_Annulation refusée par HeroSMS — le numéro sera remboursé automatiquement après 20 min._"
-            elif not cancelled:
+                cancel_note = "\n_Annulation refusée — remboursement auto dans 20 min._"
+            elif "ACCESS_CANCEL" not in cancel_resp and "CANCEL" not in cancel_resp.upper():
                 cancel_note = f"\n_Réponse annulation : `{cancel_resp}`_"
 
             embed_fail = discord.Embed(
                 title="⏱️  PAS DE CODE",
                 description=(
                     f"# 📱  {phone_display}\n\n"
-                    f"**PAS DE CODE ? ANNULE ET PRENDS-EN UN AUTRE.**"
+                    f"**PAS DE CODE ? PRENDS-EN UN AUTRE.**"
                     f"{cancel_note}"
                 ),
                 color=0xE74C3C,
@@ -405,12 +479,10 @@ async def cmd_prix(interaction: discord.Interaction):
     balance = await hero_get_balance()
     prices_raw = await hero_get_prices()
 
-    # Essayer de parser le JSON des prix
     info = f"**Solde** : `{balance}`\n\n"
     try:
         import json
         data = json.loads(prices_raw)
-        # Format: { "187": { "tw": { "cost": X, "count": Y } } }
         if HERO_COUNTRY in data and SERVICE in data[HERO_COUNTRY]:
             s = data[HERO_COUNTRY][SERVICE]
             info += f"**Service** : `{SERVICE}` (Twitter)\n"
@@ -483,10 +555,8 @@ async def on_ready():
     global http_session
     http_session = aiohttp.ClientSession()
 
-    # Enregistrer la vue persistante
     bot.add_view(TwitterPanel())
 
-    # Sync des commandes slash
     if GUILD_ID:
         guild = discord.Object(id=GUILD_ID)
         bot.tree.copy_global_to(guild=guild)
